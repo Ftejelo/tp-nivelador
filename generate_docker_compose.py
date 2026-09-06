@@ -33,10 +33,15 @@ def generate_docker_compose(num_clients):
     container_name: client_{i}
     depends_on:
       - server
+    volumes:
+      - ./input:/input
+      - ./output:/output
     environment:
       - AGENCY_ID={i}
       - SERVER_HOST=server
       - SERVER_PORT=5678
+      - INPUT_FILE=/input/input-{i}.csv
+      - OUTPUT_FILE=/output/output-{i}.txt
 
 """
     

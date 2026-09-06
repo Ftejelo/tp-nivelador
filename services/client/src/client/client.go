@@ -1,32 +1,35 @@
 package client
 
 import (
+	"bufio"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/safe_socket"
 )
 
-const CONNECTION_ATTEMPTS_MAX = 3
-const CONNECTION_ATTEMPS_DELAY_MS = 200
+const ConnectionAttemptsMax = 3
+const ConnectionAttempsDelayMs = 200
 
-const ECHO_CLIENT_BUFFER_SIZE = 512
-const ECHO_CLIENT_MESSAGE_AMOUNT = 3
-const ECHO_CLIENT_MESSAGE_DELAY_MS = 1000
+const EchoClientBufferSize = 512
 
-type ClientConfig struct {
+type Config struct {
 	ServerHost string
 	ServerPort string
 	AgencyId   string
+	InputFile  string
+	OutputFile string
 }
 
 type Client struct {
 	conn   net.Conn
-	config ClientConfig
+	config Config
 }
 
-func NewClient(config ClientConfig) (*Client, error) {
+func NewClient(config Config) (*Client, error) {
 	conn, err := connectToServer(config.ServerHost, config.ServerPort)
 	if err != nil {
 		logger.Warn("connect-to-server", logger.Fail)
@@ -43,11 +46,11 @@ func connectToServer(host, port string) (net.Conn, error) {
 	var conn net.Conn
 
 	logger.Info(action, logger.InProgress)
-	for i := range CONNECTION_ATTEMPTS_MAX {
+	for i := range ConnectionAttemptsMax {
 		conn, err = net.Dial("tcp", host+":"+port)
 		if err != nil {
 			logger.Warn(action, logger.Fail, "attempt", i)
-			time.Sleep(CONNECTION_ATTEMPS_DELAY_MS * time.Millisecond)
+			time.Sleep(ConnectionAttempsDelayMs * time.Millisecond)
 			continue
 		}
 
@@ -59,34 +62,72 @@ func connectToServer(host, port string) (net.Conn, error) {
 }
 
 func (client *Client) Run() error {
-	const mainAction = "test-echo-server"
+	const mainAction = "process-bets"
 	defer client.conn.Close()
 
-	for messageId := range ECHO_CLIENT_MESSAGE_AMOUNT {
-		messageArgs := []any{"agency-id", client.config.AgencyId, "message-id", messageId}
+	// Open input file
+	inputFile, err := os.Open(client.config.InputFile)
+	if err != nil {
+		logger.Error("open-input-file", logger.Fail, "file", client.config.InputFile, "err", err)
+		return err
+	}
+	defer inputFile.Close()
+
+	// Create output file
+	outputFile, err := os.Create(client.config.OutputFile)
+	if err != nil {
+		logger.Error("create-output-file", logger.Fail, "file", client.config.OutputFile, "err", err)
+		return err
+	}
+	defer outputFile.Close()
+
+	scanner := bufio.NewScanner(inputFile)
+	lineNumber := 0
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		lineNumber++
+
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+
+		messageArgs := []any{"agency-id", client.config.AgencyId, "line", lineNumber}
 		logger.Info(mainAction, logger.InProgress, messageArgs...)
 
-		clientMessage := client.config.AgencyId
-
-		if err := safe_socket.SendAll(client.conn, []byte(clientMessage)); err != nil {
+		// Send line to server
+		if err := safe_socket.SendAll(client.conn, []byte(line)); err != nil {
 			logger.Error("send-message", logger.Fail, messageArgs...)
 			return err
 		}
 
-		responseBuffer, err := safe_socket.RecvAll(client.conn, ECHO_CLIENT_BUFFER_SIZE)
+		// Receive response from server
+		responseBuffer, err := safe_socket.RecvAll(client.conn, EchoClientBufferSize)
 		if err != nil {
 			logger.Error("recv-response", logger.Fail, messageArgs...)
 			return err
 		}
 
-		if string(responseBuffer) != clientMessage {
-			logger.Error("check-response", logger.Fail, messageArgs...)
+		// Write response to output file
+		if _, err := outputFile.Write(responseBuffer); err != nil {
+			logger.Error("write-output", logger.Fail, messageArgs...)
 			return err
 		}
 
-		time.Sleep(ECHO_CLIENT_MESSAGE_DELAY_MS * time.Millisecond)
+		// Add newline after each response
+		if _, err := outputFile.WriteString("\n"); err != nil {
+			logger.Error("write-output-newline", logger.Fail, messageArgs...)
+			return err
+		}
 	}
-	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId)
+
+	if err := scanner.Err(); err != nil {
+		logger.Error("scan-input-file", logger.Fail, "err", err)
+		return err
+	}
+
+	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId, "lines-processed", lineNumber)
 
 	return nil
 }
