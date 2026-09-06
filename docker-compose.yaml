@@ -10,6 +10,7 @@ services:
       - PYTHONUNBUFFERED=1
       - SERVER_HOST=server
       - SERVER_PORT=5678
+      - LOTTERY_STORAGE_PATH=/tmp/lottery_bets.csv
 
   client_0:
     build:

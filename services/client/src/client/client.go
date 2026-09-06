@@ -2,19 +2,19 @@ package client
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
-	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/safe_socket"
+	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/protocol"
 )
 
 const ConnectionAttemptsMax = 3
 const ConnectionAttempsDelayMs = 200
-
-const EchoClientBufferSize = 512
 
 type Config struct {
 	ServerHost string
@@ -73,15 +73,15 @@ func (client *Client) Run() error {
 	}
 	defer inputFile.Close()
 
-	// Create output file
-	outputFile, err := os.Create(client.config.OutputFile)
+	// Parse agency ID
+	agencyId, err := strconv.Atoi(client.config.AgencyId)
 	if err != nil {
-		logger.Error("create-output-file", logger.Fail, "file", client.config.OutputFile, "err", err)
+		logger.Error("parse-agency-id", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 		return err
 	}
-	defer outputFile.Close()
 
 	scanner := bufio.NewScanner(inputFile)
+	bets := []protocol.Bet{}
 	lineNumber := 0
 
 	for scanner.Scan() {
@@ -93,33 +93,35 @@ func (client *Client) Run() error {
 			continue
 		}
 
-		messageArgs := []any{"agency-id", client.config.AgencyId, "line", lineNumber}
-		logger.Info(mainAction, logger.InProgress, messageArgs...)
-
-		// Send line to server
-		if err := safe_socket.SendAll(client.conn, []byte(line)); err != nil {
-			logger.Error("send-message", logger.Fail, messageArgs...)
-			return err
+		// Parse bet from CSV line: first_name,last_name,document,birthdate,number
+		fields := strings.Split(line, ",")
+		if len(fields) != 5 {
+			logger.Warn("parse-bet", logger.Fail, "line", lineNumber, "reason", "invalid format")
+			continue
 		}
 
-		// Receive response from server
-		responseBuffer, err := safe_socket.RecvAll(client.conn, EchoClientBufferSize)
+		document, err := strconv.Atoi(fields[2])
 		if err != nil {
-			logger.Error("recv-response", logger.Fail, messageArgs...)
-			return err
+			logger.Warn("parse-bet", logger.Fail, "line", lineNumber, "reason", "invalid document")
+			continue
 		}
 
-		// Write response to output file
-		if _, err := outputFile.Write(responseBuffer); err != nil {
-			logger.Error("write-output", logger.Fail, messageArgs...)
-			return err
+		number, err := strconv.Atoi(fields[4])
+		if err != nil {
+			logger.Warn("parse-bet", logger.Fail, "line", lineNumber, "reason", "invalid number")
+			continue
 		}
 
-		// Add newline after each response
-		if _, err := outputFile.WriteString("\n"); err != nil {
-			logger.Error("write-output-newline", logger.Fail, messageArgs...)
-			return err
+		bet := protocol.Bet{
+			AgencyId:  agencyId,
+			FirstName: fields[0],
+			LastName:  fields[1],
+			Document:  document,
+			Birthdate: fields[3],
+			Number:    number,
 		}
+
+		bets = append(bets, bet)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -127,7 +129,67 @@ func (client *Client) Run() error {
 		return err
 	}
 
-	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId, "lines-processed", lineNumber)
+	// Send bets to server
+	if len(bets) > 0 {
+		betMsg := protocol.BetMessage{Bets: bets}
+		messageArgs := []any{"agency-id", client.config.AgencyId, "bets-count", len(bets)}
+		logger.Info("send-bets", logger.InProgress, messageArgs...)
+
+		if err := protocol.SendMessage(client.conn, protocol.BetMsg, betMsg); err != nil {
+			logger.Error("send-bets", logger.Fail, messageArgs...)
+			return err
+		}
+
+		logger.Info("send-bets", logger.Success, messageArgs...)
+	}
+
+	// Send FINISH message to trigger winner calculation
+	logger.Info("send-finish", logger.InProgress, "agency-id", client.config.AgencyId)
+	if err := protocol.SendMessage(client.conn, protocol.Finish, protocol.FinishMessage{}); err != nil {
+		logger.Error("send-finish", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
+		return err
+	}
+	logger.Info("send-finish", logger.Success, "agency-id", client.config.AgencyId)
+
+	// Receive winners from server
+	logger.Info("receive-winners", logger.InProgress, "agency-id", client.config.AgencyId)
+	msgType, payload, err := protocol.RecvMessage(client.conn)
+	if err != nil {
+		logger.Error("receive-winners", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
+		return err
+	}
+	if msgType != protocol.Winners {
+		logger.Error("receive-winners", logger.Fail, "agency-id", client.config.AgencyId, "reason", "unexpected message type")
+		return fmt.Errorf("expected WINNERS message, got %s", msgType)
+	}
+
+	winnersMsg := payload.(protocol.WinnersMessage)
+	logger.Info("receive-winners", logger.Success, "agency-id", client.config.AgencyId, "winners-count", len(winnersMsg.Winners))
+
+	// Create output file
+	outputFile, err := os.Create(client.config.OutputFile)
+	if err != nil {
+		logger.Error("create-output-file", logger.Fail, "file", client.config.OutputFile, "err", err)
+		return err
+	}
+	defer outputFile.Close()
+
+	// Write winners to output file
+	for _, winner := range winnersMsg.Winners {
+		line := fmt.Sprintf("%s,%s,%d,%s,%d",
+			winner.FirstName,
+			winner.LastName,
+			winner.Document,
+			winner.Birthdate,
+			winner.Number,
+		)
+		if _, err := outputFile.WriteString(line + "\n"); err != nil {
+			logger.Error("write-output", logger.Fail, "file", client.config.OutputFile, "err", err)
+			return err
+		}
+	}
+
+	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId, "bets-processed", len(bets), "winners-written", len(winnersMsg.Winners))
 
 	return nil
 }

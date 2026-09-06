@@ -1,37 +1,81 @@
+import os
 import socket
-import logger
-import safe_socket
 
-_ECHO_SERVER_MESSAGE_SIZE = 1024
+import logger
+import protocol
+import safe_socket
+from lottery.bet import Bet
+from lottery.lottery import Lottery
 
 
 class Server:
     def __init__(self, server_host: str, server_port: int) -> None:
         self.server_host = server_host
         self.server_port = server_port
+        self.storage_path = os.environ.get("LOTTERY_STORAGE_PATH", "/tmp/lottery_bets.csv")
+        self.lottery = Lottery(self.storage_path)
 
     def _handle_client(self, client_socket):
         action = "handle-client"
-        message_amount = 0
+        bets_received = 0
         try:
             logger.info(action, logger.LogResult.in_progress)
             while True:
-                client_message = safe_socket.recv_all(
-                    client_socket, _ECHO_SERVER_MESSAGE_SIZE
-                )
-                if not client_message:
+                msg_type, payload = protocol.recv_message(client_socket)
+                
+                if msg_type == protocol.MessageType.BET:
+                    # Convert protocol bets to lottery bets
+                    lottery_bets = []
+                    for bet in payload.bets:
+                        lottery_bets.append(Bet(
+                            agency_id=bet.agency_id,
+                            first_name=bet.first_name,
+                            last_name=bet.last_name,
+                            document=bet.document,
+                            birthdate=bet.birthdate,
+                            number=bet.number,
+                        ))
+                    
+                    # Store bets using Lottery class
+                    self.lottery.store_bets(lottery_bets)
+                    bets_received += len(lottery_bets)
+                    
+                elif msg_type == protocol.MessageType.FINISH:
+                    # Calculate winners
+                    winners = []
+                    for bet in self.lottery.load_bets():
+                        if self.lottery.has_won(bet):
+                            winners.append(bet)
+                    
+                    # Convert lottery bets to protocol bets
+                    protocol_winners = []
+                    for winner in winners:
+                        protocol_winners.append(protocol.Bet(
+                            agency_id=winner.agency_id,
+                            first_name=winner.first_name,
+                            last_name=winner.last_name,
+                            document=winner.document,
+                            birthdate=winner.birthdate,
+                            number=winner.number,
+                        ))
+                    
+                    # Send winners back to client
+                    winners_msg = protocol.WinnersMessage(winners=protocol_winners)
+                    protocol.send_message(client_socket, protocol.MessageType.WINNERS, winners_msg)
+                    
                     logger.info(
                         action,
                         logger.LogResult.success,
-                        "messages-amount",
-                        message_amount,
+                        "bets-received",
+                        bets_received,
+                        "winners-sent",
+                        len(winners),
                     )
                     return
-                message_amount += 1
-                safe_socket.send_all(client_socket, client_message)
+                    
         except Exception as e:
             logger.error(
-                action, logger.LogResult.fail, "messages-amount", message_amount
+                action, logger.LogResult.fail, "bets-received", bets_received
             )
             raise e
 
