@@ -22,6 +22,7 @@ type Config struct {
 	AgencyId   string
 	InputFile  string
 	OutputFile string
+	BatchSize  int
 }
 
 type Client struct {
@@ -64,6 +65,9 @@ func connectToServer(host, port string) (net.Conn, error) {
 func (client *Client) Run() error {
 	const mainAction = "process-bets"
 	defer client.conn.Close()
+	if client.config.BatchSize <= 0 {
+		return fmt.Errorf("invalid batch size: %d", client.config.BatchSize)
+	}
 
 	// Open input file
 	inputFile, err := os.Open(client.config.InputFile)
@@ -129,18 +133,30 @@ func (client *Client) Run() error {
 		return err
 	}
 
-	// Send bets to server
+	// Send bets to server in batches
 	if len(bets) > 0 {
-		betMsg := protocol.BetMessage{Bets: bets}
-		messageArgs := []any{"agency-id", client.config.AgencyId, "bets-count", len(bets)}
-		logger.Info("send-bets", logger.InProgress, messageArgs...)
+		for start := 0; start < len(bets); start += client.config.BatchSize {
+			end := start + client.config.BatchSize
+			if end > len(bets) {
+				end = len(bets)
+			}
+			batch := bets[start:end]
+			betMsg := protocol.BetMessage{Bets: batch}
+			messageArgs := []any{
+				"agency-id", client.config.AgencyId,
+				"bets-count", len(batch),
+				"batch-start", start,
+				"batch-end", end,
+			}
+			logger.Info("send-bets", logger.InProgress, messageArgs...)
 
-		if err := protocol.SendMessage(client.conn, protocol.BetMsg, betMsg); err != nil {
-			logger.Error("send-bets", logger.Fail, messageArgs...)
-			return err
+			if err := protocol.SendMessage(client.conn, protocol.BetMsg, betMsg); err != nil {
+				logger.Error("send-bets", logger.Fail, messageArgs...)
+				return err
+			}
+
+			logger.Info("send-bets", logger.Success, messageArgs...)
 		}
-
-		logger.Info("send-bets", logger.Success, messageArgs...)
 	}
 
 	// Send FINISH message to trigger winner calculation
