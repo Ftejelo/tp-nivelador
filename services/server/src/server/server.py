@@ -1,6 +1,8 @@
 import os
+import signal
 import socket
 import threading
+import time
 
 import logger
 import protocol
@@ -23,6 +25,13 @@ class Server:
         self.quorum_condition = threading.Condition(self.agencies_finished_lock)
         self.winners_calculated = False
         self.winners = []
+        
+        # Graceful shutdown
+        self.shutdown_requested = False
+        self.shutdown_event = threading.Event()
+        self.client_threads = []
+        self.client_sockets = []
+        self.client_threads_lock = threading.Lock()
 
     def _handle_client(self, client_socket):
         action = "handle-client"
@@ -31,7 +40,16 @@ class Server:
         try:
             logger.info(action, logger.LogResult.in_progress)
             while True:
-                msg_type, payload = protocol.recv_message(client_socket)
+                # Check for shutdown before blocking on recv
+                if self.shutdown_requested:
+                    logger.info(action, logger.LogResult.fail, "reason", "shutdown requested")
+                    return
+                
+                try:
+                    msg_type, payload = protocol.recv_message(client_socket)
+                except socket.timeout:
+                    # Timeout is expected, loop to check shutdown flag
+                    continue
                 
                 if msg_type == protocol.MessageType.BET:
                     # Convert protocol bets to lottery bets
@@ -69,6 +87,16 @@ class Server:
                         
                         # Wait for quorum to be reached
                         while self.agencies_finished < self.quorum_min:
+                            if self.shutdown_requested:
+                                logger.info(
+                                    "agency-finished",
+                                    logger.LogResult.fail,
+                                    "agency-id",
+                                    client_agency_id,
+                                    "reason",
+                                    "shutdown requested before quorum",
+                                )
+                                return
                             self.quorum_condition.wait()
                         
                         # Calculate winners only once
@@ -127,21 +155,92 @@ class Server:
                 action, logger.LogResult.fail, "bets-received", bets_received
             )
             raise e
+        finally:
+            client_socket.close()
+            # Remove thread and socket from tracking lists
+            with self.client_threads_lock:
+                if threading.current_thread() in self.client_threads:
+                    self.client_threads.remove(threading.current_thread())
+                if client_socket in self.client_sockets:
+                    self.client_sockets.remove(client_socket)
+
+    def _signal_handler(self, signum, frame):
+        action = "shutdown"
+        logger.info(action, logger.LogResult.in_progress, "signal", signum)
+        self.shutdown_requested = True
+        self.shutdown_event.set()
+        with self.agencies_finished_lock:
+            self.quorum_condition.notify_all()
+
+    def _wait_for_client_threads(self, timeout=10):
+        action = "wait-client-threads"
+        logger.info(action, logger.LogResult.in_progress, "timeout", timeout)
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.client_threads_lock:
+                if not self.client_threads:
+                    logger.info(action, logger.LogResult.success, "threads-remaining", 0)
+                    return True
+            time.sleep(0.1)
+        
+        with self.client_threads_lock:
+            remaining = len(self.client_threads)
+            logger.warn(action, logger.LogResult.fail, "threads-remaining", remaining)
+        return False
 
     def run(self):
         action = "accept-connection"
+        
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind((self.server_host, self.server_port))
             server_socket.listen()
-            while True:
+            server_socket.settimeout(1.0)  # Set timeout to check for shutdown
+            
+            logger.info("server-start", logger.LogResult.success, "host", self.server_host, "port", self.server_port)
+            
+            while not self.shutdown_requested:
                 try:
                     logger.info(action, logger.LogResult.in_progress)
                     client_socket, _ = server_socket.accept()
+                except socket.timeout:
+                    # Timeout to check for shutdown flag
+                    continue
                 except Exception as e:
+                    if self.shutdown_requested:
+                        break
                     logger.error(action, logger.LogResult.fail)
                     raise e
                 logger.info(action, logger.LogResult.success)
 
                 # Handle client in a separate thread
+                client_socket.settimeout(1.0)  # Set timeout to check for shutdown
                 client_thread = threading.Thread(target=self._handle_client, args=(client_socket,))
                 client_thread.start()
+                
+                # Track the thread and socket
+                with self.client_threads_lock:
+                    self.client_threads.append(client_thread)
+                    self.client_sockets.append(client_socket)
+            
+            # Shutdown requested - stop accepting new connections
+            logger.info("server-shutdown", logger.LogResult.in_progress)
+            server_socket.close()
+            
+            # Close all client sockets to unblock threads
+            with self.client_threads_lock:
+                for sock in self.client_sockets:
+                    try:
+                        sock.close()
+                    except:
+                        pass
+            
+            # Wait for existing client threads to finish
+            self._wait_for_client_threads(timeout=5)
+            
+            logger.info("server-shutdown", logger.LogResult.success)

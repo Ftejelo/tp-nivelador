@@ -2,6 +2,8 @@ package client
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -63,6 +65,39 @@ func connectToServer(host, port string) (net.Conn, error) {
 }
 
 func (client *Client) Run() error {
+	return client.RunWithContext(context.Background())
+}
+
+func (client *Client) recvMessageWithContext(ctx context.Context, conn *net.TCPConn) (protocol.MessageType, interface{}, error) {
+	// Use a goroutine to receive message with context cancellation
+	type result struct {
+		msgType protocol.MessageType
+		payload interface{}
+		err     error
+	}
+	
+	resultChan := make(chan result, 1)
+	
+	go func() {
+		msgType, payload, err := protocol.RecvMessage(conn)
+		resultChan <- result{msgType, payload, err}
+	}()
+	
+	select {
+	case <-ctx.Done():
+		// Context cancelled, close connection to unblock the goroutine
+		conn.Close()
+		return 0, nil, ctx.Err()
+	case res := <-resultChan:
+		return res.msgType, res.payload, res.err
+	}
+}
+
+func isContextCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (client *Client) RunWithContext(ctx context.Context) error {
 	const mainAction = "process-bets"
 	defer client.conn.Close()
 	if client.config.BatchSize <= 0 {
@@ -89,6 +124,14 @@ func (client *Client) Run() error {
 	lineNumber := 0
 
 	for scanner.Scan() {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			logger.Info(mainAction, logger.Fail, "reason", "shutdown requested", "bets-parsed", len(bets))
+			return ctx.Err()
+		default:
+		}
+
 		line := strings.TrimSpace(scanner.Text())
 		lineNumber++
 
@@ -136,6 +179,14 @@ func (client *Client) Run() error {
 	// Send bets to server in batches
 	if len(bets) > 0 {
 		for start := 0; start < len(bets); start += client.config.BatchSize {
+			// Check for context cancellation
+			select {
+			case <-ctx.Done():
+				logger.Info("send-bets", logger.Fail, "reason", "shutdown requested", "bets-sent", start)
+				return ctx.Err()
+			default:
+			}
+
 			end := start + client.config.BatchSize
 			if end > len(bets) {
 				end = len(bets)
@@ -169,8 +220,15 @@ func (client *Client) Run() error {
 
 	// Receive winners from server
 	logger.Info("receive-winners", logger.InProgress, "agency-id", client.config.AgencyId)
-	msgType, payload, err := protocol.RecvMessage(client.conn)
+	
+	// Set read deadline to allow context cancellation
+	conn := client.conn.(*net.TCPConn)
+	msgType, payload, err := client.recvMessageWithContext(ctx, conn)
 	if err != nil {
+		if isContextCanceled(err) {
+			logger.Info("receive-winners", logger.Fail, "agency-id", client.config.AgencyId, "reason", "shutdown requested")
+			return err
+		}
 		logger.Error("receive-winners", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 		return err
 	}

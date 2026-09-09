@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/client"
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
@@ -60,17 +64,52 @@ func run() int {
 		return 1
 	}
 
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
 	client, err := client.NewClient(config)
 	if err != nil {
 		logger.Error("client-new", logger.Fail, "err", err)
 		return 1
 	}
 
-	if err := client.Run(); err != nil {
-		logger.Error("client-run", logger.Fail, "err", err)
-		return 1
+	// Run client in a goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- client.RunWithContext(ctx)
+	}()
+
+	// Wait for either client completion or signal
+	select {
+	case err := <-errChan:
+		if err != nil {
+			logger.Error("client-run", logger.Fail, "err", err)
+			return 1
+		}
+		return 0
+	case sig := <-sigChan:
+		logger.Info("shutdown", logger.InProgress, "signal", sig)
+		cancel() // Signal client to shutdown gracefully
+		// Wait for client to finish with timeout
+		select {
+		case err := <-errChan:
+			// Context cancellation is expected during graceful shutdown
+			if err != nil && err != context.Canceled {
+				logger.Error("client-run", logger.Fail, "err", err)
+				return 1
+			}
+			logger.Info("shutdown", logger.Success)
+			return 0
+		case <-time.After(10 * time.Second):
+			logger.Warn("shutdown", logger.Fail, "reason", "timeout")
+			return 1
+		}
 	}
-	return 0
 }
 
 func main() {
