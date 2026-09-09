@@ -11,6 +11,7 @@ services:
       - SERVER_HOST=server
       - SERVER_PORT=5678
       - LOTTERY_STORAGE_PATH=/tmp/lottery_bets.csv
+      - AGENCY_QUORUM_MIN=5
 
   client_0:
     build:
@@ -28,6 +29,7 @@ services:
       - SERVER_PORT=5678
       - INPUT_FILE=/input/input-0.csv
       - OUTPUT_FILE=/output/output-0.txt
+      - BATCH_SIZE=10
 
   client_1:
     build:
@@ -45,6 +47,7 @@ services:
       - SERVER_PORT=5678
       - INPUT_FILE=/input/input-1.csv
       - OUTPUT_FILE=/output/output-1.txt
+      - BATCH_SIZE=10
 
   client_2:
     build:
@@ -62,6 +65,7 @@ services:
       - SERVER_PORT=5678
       - INPUT_FILE=/input/input-2.csv
       - OUTPUT_FILE=/output/output-2.txt
+      - BATCH_SIZE=10
 
   client_3:
     build:
@@ -79,6 +83,7 @@ services:
       - SERVER_PORT=5678
       - INPUT_FILE=/input/input-3.csv
       - OUTPUT_FILE=/output/output-3.txt
+      - BATCH_SIZE=10
 
   client_4:
     build:
@@ -96,3 +101,4 @@ services:
       - SERVER_PORT=5678
       - INPUT_FILE=/input/input-4.csv
       - OUTPUT_FILE=/output/output-4.txt
+      - BATCH_SIZE=10
