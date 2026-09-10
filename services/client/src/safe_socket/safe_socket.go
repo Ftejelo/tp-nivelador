@@ -10,7 +10,7 @@ func SendAll(socket io.Writer, bytes []byte) error {
 			return err
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			continue
 		}
 		totalSent += n
 	}
@@ -29,7 +29,7 @@ func RecvAll(socket io.Reader, size int) ([]byte, error) {
 			return nil, err
 		}
 		if n == 0 {
-			return nil, io.ErrUnexpectedEOF
+			continue
 		}
 		totalRead += n
 	}

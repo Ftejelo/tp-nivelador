@@ -15,8 +15,8 @@ import (
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/protocol"
 )
 
-const ConnectionAttemptsMax = 3
-const ConnectionAttempsDelayMs = 200
+const ConnectionAttemptsMax = 20
+const ConnectionAttempsDelayMs = 250
 
 type Config struct {
 	ServerHost string
@@ -37,6 +37,11 @@ func NewClient(config Config) (*Client, error) {
 	if err != nil {
 		logger.Warn("connect-to-server", logger.Fail)
 		return nil, err
+	}
+	if config.BatchSize >= 8 {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+		}
 	}
 
 	client := &Client{conn: conn, config: config}
@@ -120,27 +125,44 @@ func (client *Client) RunWithContext(ctx context.Context) error {
 	}
 
 	scanner := bufio.NewScanner(inputFile)
-	bets := []protocol.Bet{}
+	batch := make([]protocol.Bet, 0, client.config.BatchSize)
 	lineNumber := 0
+	totalBets := 0
+	flushBatch := func(start int) error {
+		if len(batch) == 0 {
+			return nil
+		}
+		betMsg := protocol.BetMessage{Bets: append([]protocol.Bet(nil), batch...)}
+		messageArgs := []any{
+			"agency-id", client.config.AgencyId,
+			"bets-count", len(batch),
+			"batch-start", start,
+			"batch-end", start + len(batch),
+		}
+		logger.Info("send-bets", logger.InProgress, messageArgs...)
+		if err := protocol.SendMessage(client.conn, protocol.BetMsg, betMsg); err != nil {
+			logger.Error("send-bets", logger.Fail, messageArgs...)
+			return err
+		}
+		logger.Info("send-bets", logger.Success, messageArgs...)
+		batch = batch[:0]
+		return nil
+	}
 
 	for scanner.Scan() {
-		// Check for context cancellation
 		select {
 		case <-ctx.Done():
-			logger.Info(mainAction, logger.Fail, "reason", "shutdown requested", "bets-parsed", len(bets))
+			logger.Info(mainAction, logger.Fail, "reason", "shutdown requested", "bets-parsed", totalBets)
 			return ctx.Err()
 		default:
 		}
 
 		line := strings.TrimSpace(scanner.Text())
 		lineNumber++
-
-		// Skip empty lines
 		if line == "" {
 			continue
 		}
 
-		// Parse bet from CSV line: first_name,last_name,document,birthdate,number
 		fields := strings.Split(line, ",")
 		if len(fields) != 5 {
 			logger.Warn("parse-bet", logger.Fail, "line", lineNumber, "reason", "invalid format")
@@ -159,55 +181,29 @@ func (client *Client) RunWithContext(ctx context.Context) error {
 			continue
 		}
 
-		bet := protocol.Bet{
+		batch = append(batch, protocol.Bet{
 			AgencyId:  agencyId,
 			FirstName: fields[0],
 			LastName:  fields[1],
 			Document:  document,
 			Birthdate: fields[3],
 			Number:    number,
-		}
+		})
+		totalBets++
 
-		bets = append(bets, bet)
+		if len(batch) >= client.config.BatchSize {
+			if err := flushBatch(totalBets - len(batch)); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		logger.Error("scan-input-file", logger.Fail, "err", err)
 		return err
 	}
-
-	// Send bets to server in batches
-	if len(bets) > 0 {
-		for start := 0; start < len(bets); start += client.config.BatchSize {
-			// Check for context cancellation
-			select {
-			case <-ctx.Done():
-				logger.Info("send-bets", logger.Fail, "reason", "shutdown requested", "bets-sent", start)
-				return ctx.Err()
-			default:
-			}
-
-			end := start + client.config.BatchSize
-			if end > len(bets) {
-				end = len(bets)
-			}
-			batch := bets[start:end]
-			betMsg := protocol.BetMessage{Bets: batch}
-			messageArgs := []any{
-				"agency-id", client.config.AgencyId,
-				"bets-count", len(batch),
-				"batch-start", start,
-				"batch-end", end,
-			}
-			logger.Info("send-bets", logger.InProgress, messageArgs...)
-
-			if err := protocol.SendMessage(client.conn, protocol.BetMsg, betMsg); err != nil {
-				logger.Error("send-bets", logger.Fail, messageArgs...)
-				return err
-			}
-
-			logger.Info("send-bets", logger.Success, messageArgs...)
-		}
+	if err := flushBatch(totalBets - len(batch)); err != nil {
+		return err
 	}
 
 	// Send FINISH message to trigger winner calculation
@@ -263,7 +259,7 @@ func (client *Client) RunWithContext(ctx context.Context) error {
 		}
 	}
 
-	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId, "bets-processed", len(bets), "winners-written", len(winnersMsg.Winners))
+	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId, "bets-processed", totalBets, "winners-written", len(winnersMsg.Winners))
 
 	return nil
 }

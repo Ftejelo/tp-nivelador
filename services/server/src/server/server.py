@@ -189,58 +189,77 @@ class Server:
             logger.warn(action, logger.LogResult.fail, "threads-remaining", remaining)
         return False
 
-    def run(self):
+    def _accept_loop(self, server_socket):
         action = "accept-connection"
-        
+        while not self.shutdown_requested:
+            try:
+                logger.info(action, logger.LogResult.in_progress)
+                client_socket, _ = server_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.shutdown_requested:
+                    break
+                raise
+            except Exception as e:
+                if self.shutdown_requested:
+                    break
+                logger.error(action, logger.LogResult.fail)
+                raise e
+
+            logger.info(action, logger.LogResult.success)
+            client_socket.settimeout(1.0)
+            client_thread = threading.Thread(
+                target=self._handle_client,
+                args=(client_socket,),
+                daemon=True,
+            )
+            client_thread.start()
+
+            with self.client_threads_lock:
+                self.client_threads.append(client_thread)
+                self.client_sockets.append(client_socket)
+
+    def run(self):
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
-        
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind((self.server_host, self.server_port))
             server_socket.listen()
-            server_socket.settimeout(1.0)  # Set timeout to check for shutdown
-            
-            logger.info("server-start", logger.LogResult.success, "host", self.server_host, "port", self.server_port)
-            
-            while not self.shutdown_requested:
-                try:
-                    logger.info(action, logger.LogResult.in_progress)
-                    client_socket, _ = server_socket.accept()
-                except socket.timeout:
-                    # Timeout to check for shutdown flag
-                    continue
-                except Exception as e:
-                    if self.shutdown_requested:
-                        break
-                    logger.error(action, logger.LogResult.fail)
-                    raise e
-                logger.info(action, logger.LogResult.success)
+            server_socket.settimeout(1.0)
 
-                # Handle client in a separate thread
-                client_socket.settimeout(1.0)  # Set timeout to check for shutdown
-                client_thread = threading.Thread(target=self._handle_client, args=(client_socket,))
-                client_thread.start()
-                
-                # Track the thread and socket
-                with self.client_threads_lock:
-                    self.client_threads.append(client_thread)
-                    self.client_sockets.append(client_socket)
-            
-            # Shutdown requested - stop accepting new connections
+            logger.info(
+                "server-start",
+                logger.LogResult.success,
+                "host",
+                self.server_host,
+                "port",
+                self.server_port,
+            )
+
+            accept_thread = threading.Thread(
+                target=self._accept_loop,
+                args=(server_socket,),
+                daemon=True,
+            )
+            accept_thread.start()
+
+            while not self.shutdown_requested:
+                self.shutdown_event.wait(0.2)
+
             logger.info("server-shutdown", logger.LogResult.in_progress)
             server_socket.close()
-            
-            # Close all client sockets to unblock threads
+
             with self.client_threads_lock:
-                for sock in self.client_sockets:
+                for sock in list(self.client_sockets):
                     try:
                         sock.close()
-                    except:
+                    except Exception:
                         pass
-            
-            # Wait for existing client threads to finish
+
             self._wait_for_client_threads(timeout=5)
-            
+            accept_thread.join(timeout=5)
             logger.info("server-shutdown", logger.LogResult.success)
